@@ -14,6 +14,8 @@ const root = path.dirname(fileURLToPath(import.meta.url));
 const COOKIE = '__Host-copilot-webui';
 const AUTH_TTL = 12 * 60 * 60 * 1000;
 const HISTORY_LIMIT = 1024 * 1024;
+const IMAGE_LIMIT = 10 * 1024 * 1024;
+const UPLOAD_QUOTA = 200 * 1024 * 1024;
 const SESSION_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const assets = new Map([
   ['/', ['public/index.html', 'text/html; charset=utf-8']],
@@ -51,6 +53,28 @@ async function jsonBody(req) {
   }
 }
 
+async function imageBody(req) {
+  const type = req.headers['content-type'];
+  const extension = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp' }[type];
+  if (!extension) throw new HttpError(415, '仅支持 PNG、JPEG 和 WebP 图片。');
+  if (Number(req.headers['content-length']) > IMAGE_LIMIT) throw new HttpError(413, '图片不能超过 10 MiB。');
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > IMAGE_LIMIT) throw new HttpError(413, '图片不能超过 10 MiB。');
+    chunks.push(chunk);
+  }
+  const data = Buffer.concat(chunks);
+  const valid = extension === 'png'
+    ? data.length >= 24 && data.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'))
+    : extension === 'jpg'
+      ? data.length >= 4 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff
+      : data.length >= 12 && data.toString('ascii', 0, 4) === 'RIFF' && data.toString('ascii', 8, 12) === 'WEBP';
+  if (!valid) throw new HttpError(400, '图片内容与格式不匹配。');
+  return { data, extension };
+}
+
 export async function createApplication(options = {}) {
   const home = fs.realpathSync(options.home ?? os.homedir());
   const host = options.host ?? process.env.WEBUI_HOST ?? '127.0.0.1';
@@ -69,6 +93,10 @@ export async function createApplication(options = {}) {
   const dataDir = options.dataDir ?? process.env.WEBUI_DATA_DIR ?? path.join(home, '.local/share/copilot-webui');
   fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   fs.chmodSync(dataDir, 0o700);
+  const uploadsDir = path.join(dataDir, 'uploads');
+  fs.mkdirSync(uploadsDir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(uploadsDir, 0o700);
+  let uploadedBytes = fs.readdirSync(uploadsDir).reduce((size, name) => size + fs.lstatSync(path.join(uploadsDir, name)).size, 0);
   const keyFile = path.join(dataDir, 'access-key');
   if (!fs.existsSync(keyFile)) fs.writeFileSync(keyFile, `${randomBytes(24).toString('base64url')}\n`, { flag: 'wx', mode: 0o600 });
   fs.chmodSync(keyFile, 0o600);
@@ -291,6 +319,19 @@ export async function createApplication(options = {}) {
       }
       if (url.pathname === '/api/sessions' && req.method === 'GET') return send(res, 200, { sessions: [...sessions.values()].map(describe) });
       if (url.pathname === '/api/history' && req.method === 'GET') return send(res, 200, { sessions: getHistory() });
+      const imageMatch = url.pathname.match(/^\/api\/sessions\/([a-f0-9-]{36})\/images$/);
+      if (imageMatch && req.method === 'POST') {
+        const s = sessions.get(imageMatch[1]);
+        if (!s) throw new HttpError(404, '会话不存在。');
+        if (s.status !== 'running') throw new HttpError(409, '会话已结束，无法添加图片。');
+        const { data, extension } = await imageBody(req);
+        if (sessions.get(s.id) !== s || s.status !== 'running') throw new HttpError(409, '会话已关闭，图片未保存。');
+        if (uploadedBytes + data.length > UPLOAD_QUOTA) throw new HttpError(507, '图片存储已达 200 MiB，请清理 uploads 目录中不再需要的图片。');
+        const filename = path.join(uploadsDir, `${randomUUID()}.${extension}`);
+        fs.writeFileSync(filename, data, { flag: 'wx', mode: 0o600 });
+        uploadedBytes += data.length;
+        return send(res, 201, { path: filename });
+      }
       if (url.pathname === '/api/sessions' && req.method === 'POST') {
         const body = await jsonBody(req);
         if (sessions.size >= maxSessions) throw new HttpError(409, `最多保留 ${maxSessions} 个会话，请先关闭不需要的会话。`);

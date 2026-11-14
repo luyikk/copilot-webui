@@ -1,11 +1,11 @@
 import https from 'node:https';
 
-export function request(base, route, { method = 'GET', json, cookie, origin = base, headers = {}, localAddress } = {}) {
+export function request(base, route, { method = 'GET', json, raw, cookie, origin = base, headers = {}, localAddress } = {}) {
   return new Promise((resolve, reject) => {
-    const data = json === undefined ? undefined : JSON.stringify(json);
+    const data = raw ?? (json === undefined ? undefined : JSON.stringify(json));
     const req = https.request(`${base}${route}`, {
       rejectUnauthorized: false, method, localAddress,
-      headers: { Origin: origin, ...(data ? { 'Content-Type': 'application/json' } : {}), ...(cookie ? { Cookie: cookie } : {}), ...headers },
+      headers: { Origin: origin, ...(data ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) } : {}), ...(cookie ? { Cookie: cookie } : {}), ...headers },
     }, res => {
       let text = '';
       res.setEncoding('utf8');

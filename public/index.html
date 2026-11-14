@@ -95,6 +95,7 @@
           <div class="terminal-actions"><button id="copy-all" class="terminal-text-button" title="打开可自由选择复制的纯文本">复制终端文本</button><button id="copy-selection" class="icon-button" title="复制选中文字（Ctrl C）" aria-label="复制选中文字"><svg><use href="#i-copy"/></svg></button><button id="interrupt-session" class="terminal-text-button" title="确认后发送 Ctrl C，可能退出 CLI">中断</button><button id="font-smaller" class="text-button" title="缩小字号" aria-label="缩小字号">A−</button><button id="font-larger" class="text-button" title="放大字号" aria-label="放大字号">A+</button><button id="fullscreen" class="icon-button" title="全屏终端" aria-label="全屏终端"><svg><use href="#i-expand"/></svg></button><button id="close-session" class="icon-button danger-hover" title="结束此会话" aria-label="结束此会话"><svg><use href="#i-close"/></svg></button></div>
         </div>
         <div id="terminal-container" class="terminal-container"></div>
+        <div class="image-controls"><button id="add-image" class="terminal-text-button">添加截图 / 图片</button><span>终端 Ctrl V 可粘贴截图 · 发送前可预览</span></div>
         <div class="mobile-keys"><button data-key="esc">Esc</button><button data-key="tab">Tab</button><button data-key="up">↑</button><button data-key="down">↓</button><button data-key="interrupt">中断</button><button data-key="enter">Enter ↵</button></div>
         <footer class="terminal-footer"><span id="terminal-path"></span><span>Shift 拖动后自动复制 <b>·</b> 中断需确认 <b>·</b> 刷新保留会话</span></footer>
       </section>
@@ -125,5 +126,14 @@
     <div class="confirm-actions"><button id="cancel-interrupt" class="button button-secondary">取消</button><button id="confirm-interrupt" class="button button-danger">发送中断</button></div>
   </dialog>
   <div id="toast" class="toast" role="status" hidden></div>
+  <dialog id="image-dialog" class="dialog">
+    <div class="dialog-heading"><h2>添加截图 / 图片</h2><button id="close-image" class="icon-button" aria-label="关闭图片窗口"><svg><use href="#i-close"/></svg></button></div>
+    <p class="dialog-description">粘贴截图，或选择 PNG / JPEG / WebP 图片（最大 10 MiB）。图片保存到本机，添加后可继续输入说明，按 Enter 才发送给 Copilot。</p>
+    <div class="image-buttons"><button id="read-image-clipboard" class="button button-secondary">读取剪贴板截图</button><button id="choose-image" class="button button-secondary">选择图片</button></div>
+    <input id="image-file" type="file" accept="image/png,image/jpeg,image/webp" hidden>
+    <img id="image-preview" alt="待添加的图片预览" hidden>
+    <p id="image-error" class="error-text" role="alert"></p>
+    <div class="confirm-actions"><button id="attach-image" class="button button-primary" disabled>添加到当前输入</button></div>
+  </dialog>
 </body>
 </html>

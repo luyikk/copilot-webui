@@ -40,6 +40,7 @@ function closeSidebar() {
   $('sidebar-shade').hidden = true;
 }
 function disconnect() {
+  if ($('image-dialog').open) $('image-dialog').close();
   state.selectionDrag = null;
   clearCopySelection();
   state.viewVersion++;
@@ -197,6 +198,9 @@ function openSession(id) {
   });
   state.terminal.attachCustomKeyEventHandler(event => {
     if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'c') {
+      return false;
+    }
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'v') {
       return false;
     }
     if (event.type === 'keydown' && event.key === 'Enter' && event.shiftKey) {
@@ -464,6 +468,135 @@ $('terminal-container').addEventListener('keydown', event => {
   if (!['Shift', 'Control', 'Meta', 'Alt'].includes(event.key)) clearCopySelection();
 }, true);
 $('terminal-container').addEventListener('paste', clearCopySelection, true);
+let pendingImage = null;
+let imageTarget = null;
+let imageVersion = 0;
+let imageUploading = false;
+const imageTypes = ['image/png', 'image/jpeg', 'image/webp'];
+function openImageDialog() {
+  if (!state.selected || state.socket?.readyState !== WebSocket.OPEN ||
+      state.sessions.find(s => s.id === state.selected)?.status !== 'running') {
+    toast('请先连接一个正在运行的 Copilot 会话。', true);
+    return false;
+  }
+  if (!$('image-dialog').open) {
+    imageVersion++;
+    imageTarget = state.selected;
+    pendingImage = null;
+    $('image-preview').hidden = true;
+    $('image-preview').removeAttribute('src');
+    $('image-error').textContent = '';
+    $('attach-image').disabled = true;
+    $('image-dialog').showModal();
+  }
+  return true;
+}
+async function previewImage(file) {
+  if (imageUploading) return;
+  const version = ++imageVersion;
+  pendingImage = null;
+  $('attach-image').disabled = true;
+  $('image-preview').hidden = true;
+  $('image-error').textContent = '';
+  try {
+    if (!imageTypes.includes(file.type)) throw new Error('仅支持 PNG、JPEG 和 WebP 图片。');
+    if (!file.size || file.size > 10 * 1024 * 1024) throw new Error('图片必须非空，且不能超过 10 MiB。');
+    const source = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('读取图片失败。'));
+      reader.readAsDataURL(file);
+    });
+    const image = new Image();
+    image.src = source;
+    await image.decode();
+    if (version !== imageVersion || !$('image-dialog').open) return;
+    $('image-preview').src = source;
+    $('image-preview').hidden = false;
+    pendingImage = file;
+    $('attach-image').disabled = false;
+  } catch (error) {
+    if (version === imageVersion) $('image-error').textContent = `无法预览：${error.message}`;
+  }
+}
+$('add-image').addEventListener('click', openImageDialog);
+$('close-image').addEventListener('click', () => $('image-dialog').close());
+$('image-dialog').addEventListener('close', () => {
+  if ($('image-dialog').open) return;
+  imageVersion++;
+  pendingImage = null;
+  $('image-preview').removeAttribute('src');
+  $('image-file').value = '';
+});
+$('choose-image').addEventListener('click', () => $('image-file').click());
+$('image-file').addEventListener('change', () => {
+  const file = $('image-file').files[0];
+  if (file) previewImage(file);
+});
+$('read-image-clipboard').addEventListener('click', async () => {
+  const version = imageVersion;
+  try {
+    if (!navigator.clipboard?.read) throw new Error('浏览器不支持读取图片，请直接按 Ctrl V 或选择图片文件。');
+    const items = await navigator.clipboard.read();
+    for (const item of items) {
+      const type = item.types.find(type => imageTypes.includes(type));
+      if (type) {
+        const file = await item.getType(type);
+        if (version === imageVersion && $('image-dialog').open) await previewImage(file);
+        return;
+      }
+    }
+    throw new Error('剪贴板中没有支持的截图，请先复制图片。');
+  } catch (error) {
+    if (version === imageVersion) $('image-error').textContent = `无法读取剪贴板：${error.message} 可改用选择图片。`;
+  }
+});
+document.addEventListener('paste', event => {
+  if (!state.authenticated || $('terminal-view').hidden) return;
+  const target = event.target;
+  if (!$('image-dialog').open && (!$('terminal-container').contains(target) || document.querySelector('dialog[open]'))) return;
+  const item = [...(event.clipboardData?.items ?? [])].find(item => item.kind === 'file' && item.type.startsWith('image/'));
+  if (!item) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  const file = item.getAsFile();
+  if (file && openImageDialog()) previewImage(file);
+}, true);
+$('attach-image').addEventListener('click', async () => {
+  if (!pendingImage || imageUploading) return;
+  const target = imageTarget;
+  const version = state.viewVersion;
+  const previewVersion = imageVersion;
+  const socket = state.socket;
+  if (target !== state.selected || socket?.readyState !== WebSocket.OPEN) {
+    $('image-error').textContent = '会话已切换或断开，请重新添加图片。';
+    return;
+  }
+  imageUploading = true;
+  $('attach-image').disabled = true;
+  $('attach-image').textContent = '正在上传…';
+  try {
+    const body = await api(`/api/sessions/${target}/images`, {
+      method: 'POST', headers: { 'Content-Type': pendingImage.type }, body: pendingImage,
+    });
+    if (previewVersion !== imageVersion || !$('image-dialog').open ||
+        version !== state.viewVersion || target !== state.selected || socket !== state.socket ||
+        !sendTerminal({ type: 'input', data: `\x1b[200~${body.path}\x1b[201~` })) {
+      throw new Error(`图片已保存，但预览已关闭、会话已切换或断开，未插入输入框。图片路径：${body.path}`);
+    }
+    clearCopySelection();
+    $('image-dialog').close();
+    state.terminal?.focus();
+    toast('图片已添加。输入说明后按 Enter 发送给 Copilot。');
+  } catch (error) {
+    $('image-error').textContent = error.message;
+    if (!$('image-dialog').open) toast(error.message, true);
+  } finally {
+    imageUploading = false;
+    $('attach-image').disabled = !pendingImage;
+    $('attach-image').textContent = '添加到当前输入';
+  }
+});
 document.addEventListener('selectionchange', () => {
   const selection = window.getSelection();
   if (selection && !selection.isCollapsed &&

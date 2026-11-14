@@ -145,6 +145,55 @@ test('enforces session limits even for simultaneous creation requests', async ()
   assert.equal(responses.filter(r => r.status === 409).length, 2);
 });
 
+test('image uploads require authentication, trusted origin and an active session, and save private files', async () => {
+  const created = await createSession();
+  const route = `/api/sessions/${created.body.id}/images`;
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aHdQAAAAASUVORK5CYII=', 'base64');
+  const upload = { method: 'POST', cookie, raw: png, headers: { 'Content-Type': 'image/png' } };
+  assert.equal((await request(base, route, { ...upload, cookie: undefined })).status, 401);
+  assert.equal((await request(base, route, { ...upload, origin: 'https://evil.example' })).status, 403);
+  assert.equal((await request(base, route, { ...upload, localAddress: '127.0.0.2' })).status, 403);
+  assert.equal((await request(base, route, { ...upload, headers: { 'Content-Type': 'image/svg+xml' } })).status, 415);
+  assert.equal((await request(base, route, { ...upload, raw: Buffer.from('not a PNG') })).status, 400);
+  assert.equal((await request(base, route, { ...upload, headers: { 'Content-Type': 'image/jpeg' } })).status, 400);
+  assert.equal((await request(base, route, { ...upload, raw: Buffer.alloc(10 * 1024 * 1024 + 1) })).status, 413);
+  const response = await request(base, route, upload);
+  assert.equal(response.status, 201);
+  assert.equal(path.dirname(response.body.path), path.join(temporary, 'state/uploads'));
+  assert.equal((await fs.stat(response.body.path)).mode & 0o777, 0o600);
+  assert.equal((await fs.stat(path.dirname(response.body.path))).mode & 0o777, 0o700);
+  assert.deepEqual(await fs.readFile(response.body.path), png);
+  assert.equal(mock.terminals.at(-1).writes.length, 0, 'Uploading must not send input automatically');
+  assert.equal((await request(base, '/uploads/' + path.basename(response.body.path), { cookie })).status, 404);
+  mock.terminals.at(-1).exit(0);
+  assert.equal((await request(base, route, upload)).status, 409);
+  await request(base, `/api/sessions/${created.body.id}`, { method: 'DELETE', cookie });
+  assert.equal((await request(base, route, upload)).status, 404);
+  assert.deepEqual(await fs.readFile(response.body.path), png, 'Saved images must survive closing a session');
+});
+
+test('image upload storage quota survives service restart', async () => {
+  const quotaDir = path.join(temporary, 'quota-state');
+  await fs.mkdir(path.join(quotaDir, 'uploads'), { recursive: true });
+  const file = await fs.open(path.join(quotaDir, 'uploads', 'existing.png'), 'w');
+  await file.truncate(200 * 1024 * 1024);
+  await file.close();
+  const instance = await createApplication({ home, dataDir: quotaDir, host: '127.0.0.1', port: 0, spawnPty: mock.spawn });
+  try {
+    const url = await instance.listen();
+    const secret = (await fs.readFile(instance.keyFile, 'utf8')).trim();
+    const loginResponse = await request(url, '/api/login', { method: 'POST', json: { key: secret } });
+    const auth = loginResponse.headers['set-cookie'][0].split(';')[0];
+    const session = await request(url, '/api/sessions', { method: 'POST', cookie: auth, json: { cwd: home } });
+    const response = await request(url, `/api/sessions/${session.body.id}/images`, {
+      method: 'POST', cookie: auth, raw: Buffer.from('89504e470d0a1a0a00000000000000000000000000000000', 'hex'),
+      headers: { 'Content-Type': 'image/png' },
+    });
+    assert.equal(response.status, 507);
+    assert.deepEqual(await fs.readdir(path.join(quotaDir, 'uploads')), ['existing.png']);
+  } finally { await instance.close(); }
+});
+
 test('closed sessions remain in history and resume using the same CLI identity', async () => {
   const created = await createSession(path.join(home, 'project'));
   const id = created.body.id;
