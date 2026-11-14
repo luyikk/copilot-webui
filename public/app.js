@@ -1,9 +1,12 @@
 /* global Terminal, FitAddon */
 'use strict';
 const $ = id => document.getElementById(id);
+$('favicon').href = `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="#c9f277">${$('i-bot').innerHTML}</svg>`)}`;
 const state = {
-  info: null, sessions: [], selected: null, cwd: '', directory: '', terminal: null, fit: null,
+  info: null, sessions: [], history: [], sessionTab: 'active', selected: null, cwd: '', directory: '', terminal: null, fit: null,
   socket: null, reconnect: null, refresh: null, closeTarget: null, toastTimer: null,
+  selectionText: '',
+  selectionDrag: null,
   fontSize: Math.max(10, Math.min(24, Number(localStorage.getItem('copilot-font-size')) || 14)), viewVersion: 0, authenticated: false,
 };
 const icons = name => {
@@ -37,6 +40,8 @@ function closeSidebar() {
   $('sidebar-shade').hidden = true;
 }
 function disconnect() {
+  state.selectionDrag = null;
+  clearCopySelection();
   state.viewVersion++;
   clearTimeout(state.reconnect);
   if (state.socket) {
@@ -82,19 +87,29 @@ async function loadApp() {
   }, 7000);
 }
 async function refreshSessions() {
-  const body = await api('/api/sessions');
+  const [body, history] = await Promise.all([api('/api/sessions'), api('/api/history')]);
   state.sessions = body.sessions;
+  state.history = history.sessions;
   renderSessions();
   if (state.selected && !state.sessions.some(s => s.id === state.selected)) showWelcome();
 }
 function renderSessions() {
   $('session-list').replaceChildren();
   $('session-count').textContent = `${state.sessions.length} / ${state.info.maxSessions}`;
-  $('no-sessions').hidden = state.sessions.length > 0;
-  for (const session of state.sessions) {
+  $('history-count').textContent = state.history.length;
+  $('active-tab').setAttribute('aria-selected', state.sessionTab === 'active');
+  $('history-tab').setAttribute('aria-selected', state.sessionTab === 'history');
+  const list = state.sessionTab === 'history' ? state.history : state.sessions;
+  $('no-sessions').hidden = list.length > 0;
+  $('no-sessions').textContent = state.sessionTab === 'history' ? '暂无可恢复的历史会话' : '暂无当前会话，可在“历史会话”中恢复对话。';
+  for (const session of list) {
     const button = document.createElement('button');
     button.className = `session-item${state.selected === session.id ? ' active' : ''}`;
     button.title = session.cwd;
+    if (state.sessionTab === 'history' && session.busy) {
+      button.disabled = true;
+      button.title = `${session.cwd} · 正在使用，不能重复恢复`;
+    }
     button.setAttribute('aria-current', state.selected === session.id ? 'page' : 'false');
     button.append(icons('terminal'));
     const info = document.createElement('span');
@@ -105,12 +120,17 @@ function renderSessions() {
     const meta = document.createElement('span');
     meta.className = 'session-meta';
     const date = new Date(session.createdAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-    meta.textContent = `${date} · ${session.status === 'running' ? '运行中' : `已结束 (${session.exitCode})`}`;
+    meta.textContent = state.sessionTab === 'history'
+      ? `${new Date(session.createdAt).toLocaleDateString('zh-CN')} ${date} · ${session.busy ? '正在使用' : '点击恢复'}`
+      : `${date} · ${session.status === 'running' ? '运行中' : `已结束 (${session.exitCode})`}`;
     info.append(name, meta);
     const dot = document.createElement('span');
     dot.className = `status-dot${session.status === 'running' ? '' : ' offline'}`;
     button.append(info, dot);
-    button.addEventListener('click', () => openSession(session.id));
+    button.addEventListener('click', () => {
+      if (state.sessionTab === 'history') resumeSession(session.id, button);
+      else openSession(session.id);
+    });
     $('session-list').append(button);
   }
 }
@@ -145,6 +165,7 @@ function openSession(id) {
   if (!session) return;
   disconnect();
   state.selected = id;
+  state.sessionTab = 'active';
   localStorage.setItem('copilot-active-session', id);
   $('welcome').hidden = true;
   $('terminal-view').hidden = false;
@@ -163,6 +184,10 @@ function openSession(id) {
   state.fit = new FitAddon.FitAddon();
   state.terminal.loadAddon(state.fit);
   state.terminal.open($('terminal-container'));
+  state.terminal.onSelectionChange(() => {
+    const text = state.terminal?.getSelection();
+    if (text) rememberCopySelection(text);
+  });
   state.terminal.onData(data => {
     if (state.socket?.readyState !== WebSocket.OPEN) {
       toast('终端尚未连接，输入未发送。', true);
@@ -171,6 +196,9 @@ function openSession(id) {
     for (let i = 0; i < data.length; i += 16000) sendTerminal({ type: 'input', data: data.slice(i, i + 16000) });
   });
   state.terminal.attachCustomKeyEventHandler(event => {
+    if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 'c') {
+      return false;
+    }
     if (event.type === 'keydown' && event.key === 'Enter' && event.shiftKey) {
       sendTerminal({ type: 'input', data: '\x1b[13;2u' });
       return false;
@@ -200,6 +228,7 @@ function openSession(id) {
         });
         setConnection(message.session.status === 'running' ? '已连接' : `已结束 · ${message.session.exitCode}`, message.session.status === 'running' ? '' : 'offline');
       } else if (message.type === 'output') state.terminal.write(message.data);
+      else if (message.type === 'error') toast(message.message, true);
       else if (message.type === 'exit') {
         setConnection(`已结束 · ${message.exitCode}`, 'offline');
         state.terminal.write(`\r\n\x1b[90m[会话已结束，退出码 ${message.exitCode}]\x1b[0m\r\n`);
@@ -248,6 +277,17 @@ async function startSession() {
     toast(error.message, true);
   } finally { button.disabled = false; }
 }
+async function resumeSession(id, button) {
+  button.disabled = true;
+  try {
+    const session = await api('/api/sessions', { method: 'POST', body: JSON.stringify({ resumeId: id }) });
+    await refreshSessions();
+    openSession(session.id);
+  } catch (error) { toast(error.message, true); }
+  finally { button.disabled = false; }
+}
+$('active-tab').addEventListener('click', () => { state.sessionTab = 'active'; renderSessions(); });
+$('history-tab').addEventListener('click', () => { state.sessionTab = 'history'; refreshSessions().catch(error => toast(error.message, true)); });
 let browseVersion = 0;
 async function browseDirectory(directory) {
   const version = ++browseVersion;
@@ -325,16 +365,174 @@ $('confirm-close').addEventListener('click', async () => {
   $('confirm-close').disabled = true;
   try {
     await api(`/api/sessions/${state.closeTarget}`, { method: 'DELETE' });
+    state.sessionTab = 'history';
     $('confirm-dialog').close();
     await refreshSessions();
   } catch (error) { toast(error.message, true); }
   finally { $('confirm-close').disabled = false; }
 });
-$('copy-selection').addEventListener('click', async () => {
-  const selection = state.terminal?.getSelection();
-  if (!selection) return toast('请先在终端中选中需要复制的文字。');
-  try { await navigator.clipboard.writeText(selection); toast('已复制选中的文字。'); }
-  catch { toast('浏览器未允许剪贴板访问，可使用 Ctrl Shift C 复制。', true); }
+function showCopyText(text) {
+  $('copy-text').value = text;
+  if (!$('copy-dialog').open) $('copy-dialog').showModal();
+  $('copy-text').focus();
+  $('copy-text').select();
+}
+async function copyText(text) {
+  const previousFocus = document.activeElement;
+  const temporary = document.createElement('textarea');
+  temporary.value = text;
+  temporary.readOnly = true;
+  temporary.setAttribute('aria-label', '临时复制文本');
+  temporary.style.cssText = 'position:fixed;left:-10000px;top:0;width:1px;height:1px;font-size:16px;';
+  (document.querySelector('dialog[open]') ?? document.body).append(temporary);
+  let copied = false;
+  try {
+    temporary.focus();
+    temporary.select();
+    copied = document.execCommand('copy');
+  } catch (error) {
+    console.warn('Browser synchronous copy is unavailable:', error.name);
+  } finally {
+    temporary.remove();
+    if (previousFocus instanceof HTMLElement && previousFocus.isConnected) previousFocus.focus({ preventScroll: true });
+  }
+  if (copied) {
+    toast('已复制文字。');
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    toast('已复制文字。');
+  } catch {
+    showCopyText(text);
+    toast('剪贴板访问被拒绝，请在文本框中长按或按 Ctrl C 复制。', true);
+  }
+}
+function copySelection() {
+  const selection = selectedTerminalText();
+  if (!selection) return toast('请先选中文字，或点击“复制终端文本”。Ctrl C 不会发送给 Copilot。');
+  return copyText(selection);
+}
+function selectedTerminalText() {
+  const nativeSelection = window.getSelection();
+  if (nativeSelection && !nativeSelection.isCollapsed &&
+      $('terminal-container').contains(nativeSelection.anchorNode) &&
+      $('terminal-container').contains(nativeSelection.focusNode)) {
+    const text = nativeSelection.toString();
+    if (text) return text;
+  }
+  return state.terminal?.getSelection() || state.selectionText;
+}
+function rememberCopySelection(text) {
+  state.selectionText = text;
+  $('selection-status').textContent = `已选 ${text.length} 字`;
+  $('copy-selection').classList.add('has-selection');
+}
+function clearCopySelection() {
+  state.selectionText = '';
+  $('selection-status').textContent = '';
+  $('copy-selection').classList.remove('has-selection');
+}
+$('terminal-container').addEventListener('pointerdown', event => {
+  if (event.button !== 0) return;
+  clearCopySelection();
+  state.selectionDrag = event.shiftKey && event.pointerType === 'mouse'
+    ? { id: event.pointerId, x: event.clientX, y: event.clientY, moved: false, sessionId: state.selected }
+    : null;
+}, true);
+document.addEventListener('pointermove', event => {
+  const drag = state.selectionDrag;
+  if (drag?.id === event.pointerId && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) >= 3) drag.moved = true;
+}, true);
+document.addEventListener('pointerup', event => {
+  const drag = state.selectionDrag;
+  if (!drag || drag.id !== event.pointerId) return;
+  state.selectionDrag = null;
+  if (!drag.moved || drag.sessionId !== state.selected) return;
+  const text = selectedTerminalText();
+  if (text) {
+    rememberCopySelection(text);
+    copyText(text);
+  }
+});
+document.addEventListener('pointercancel', () => { state.selectionDrag = null; }, true);
+$('terminal-container').addEventListener('pointerup', () => {
+  const text = selectedTerminalText();
+  if (text) rememberCopySelection(text);
+});
+$('terminal-container').addEventListener('keydown', event => {
+  if (!['Shift', 'Control', 'Meta', 'Alt'].includes(event.key)) clearCopySelection();
+}, true);
+$('terminal-container').addEventListener('paste', clearCopySelection, true);
+document.addEventListener('selectionchange', () => {
+  const selection = window.getSelection();
+  if (selection && !selection.isCollapsed &&
+      $('terminal-container').contains(selection.anchorNode) &&
+      $('terminal-container').contains(selection.focusNode)) {
+    const text = selection.toString();
+    if (text) rememberCopySelection(text);
+  }
+});
+let buttonSelection = '';
+$('copy-selection').addEventListener('pointerdown', () => { buttonSelection = selectedTerminalText(); });
+$('copy-selection').addEventListener('click', () => {
+  const text = selectedTerminalText() || buttonSelection;
+  buttonSelection = '';
+  if (text) copyText(text);
+  else copySelection();
+});
+document.addEventListener('copy', event => {
+  if ($('terminal-view').hidden || document.querySelector('dialog[open]')) return;
+  const target = event.target;
+  if (target instanceof Element && target.closest('input, textarea, [contenteditable="true"]') &&
+      !$('terminal-container').contains(target)) return;
+  const text = selectedTerminalText();
+  if (!text || !event.clipboardData) return;
+  event.clipboardData.setData('text/plain', text);
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  toast('已复制文字。');
+}, true);
+document.addEventListener('keydown', event => {
+  if (!(event.ctrlKey || event.metaKey) || event.altKey || event.key.toLowerCase() !== 'c' ||
+      $('terminal-view').hidden || document.querySelector('dialog[open]')) return;
+  const target = event.target;
+  if (target instanceof Element && target.closest('input, textarea, [contenteditable="true"]') &&
+      !$('terminal-container').contains(target)) return;
+  const text = selectedTerminalText();
+  if (!$('terminal-container').contains(target) && !text) return;
+  event.stopImmediatePropagation();
+  event.preventDefault();
+  if (!event.repeat) copySelection();
+}, true);
+$('copy-all').addEventListener('click', () => {
+  if (!state.terminal) return;
+  const buffer = state.terminal.buffer.active;
+  let text = '';
+  for (let i = 0; i < buffer.length; i++) {
+    const line = buffer.getLine(i);
+    if (!line) continue;
+    const wrapped = buffer.getLine(i + 1)?.isWrapped;
+    text += line.translateToString(!wrapped);
+    if (!wrapped) text += '\n';
+  }
+  showCopyText(text.trimEnd());
+});
+$('close-copy').addEventListener('click', () => $('copy-dialog').close());
+$('copy-text-button').addEventListener('click', () => copyText($('copy-text').value));
+let interruptTarget = null;
+function confirmInterrupt() {
+  interruptTarget = state.selected;
+  $('interrupt-dialog').showModal();
+}
+$('interrupt-session').addEventListener('click', confirmInterrupt);
+$('cancel-interrupt').addEventListener('click', () => $('interrupt-dialog').close());
+$('confirm-interrupt').addEventListener('click', () => {
+  clearCopySelection();
+  if (state.selected !== interruptTarget || !sendTerminal({ type: 'input', data: '\x03' })) {
+    toast('会话已切换或连接已断开，中断未发送。', true);
+  }
+  $('interrupt-dialog').close();
 });
 function changeFont(amount) {
   state.fontSize = Math.max(10, Math.min(24, state.fontSize + amount));
@@ -350,9 +548,11 @@ $('fullscreen').addEventListener('click', async () => {
     else await $('terminal-view').requestFullscreen();
   } catch { toast('当前浏览器不支持全屏，请使用浏览器的全屏功能。', true); }
 });
-const mobileKeys = { esc: '\x1b', tab: '\t', up: '\x1b[A', down: '\x1b[B', interrupt: '\x03', enter: '\r' };
+const mobileKeys = { esc: '\x1b', tab: '\t', up: '\x1b[A', down: '\x1b[B', enter: '\r' };
 for (const button of document.querySelectorAll('[data-key]')) {
   button.addEventListener('click', () => {
+    if (button.dataset.key === 'interrupt') return confirmInterrupt();
+    clearCopySelection();
     if (!sendTerminal({ type: 'input', data: mobileKeys[button.dataset.key] })) toast('终端未连接，按键未发送。', true);
     state.terminal?.focus();
   });

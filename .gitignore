@@ -12,3 +12,5 @@ tls-host
 *.db
 *.db-shm
 *.db-wal
+sessions.json
+sessions.json.tmp

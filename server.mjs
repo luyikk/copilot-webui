@@ -8,11 +8,13 @@ import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import * as pty from 'node-pty';
 import { WebSocket, WebSocketServer } from 'ws';
+import { parse as parseYaml } from 'yaml';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const COOKIE = '__Host-copilot-webui';
 const AUTH_TTL = 12 * 60 * 60 * 1000;
 const HISTORY_LIMIT = 1024 * 1024;
+const SESSION_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const assets = new Map([
   ['/', ['public/index.html', 'text/html; charset=utf-8']],
   ['/app.js', ['public/app.js', 'text/javascript; charset=utf-8']],
@@ -90,6 +92,26 @@ export async function createApplication(options = {}) {
   fs.chmodSync(tlsKey, 0o600);
 
   const sessions = new Map();
+  const stoppingSessions = new Set();
+  const recordsFile = path.join(dataDir, 'sessions.json');
+  const records = new Map();
+  const sessionStateDir = options.sessionStateDir ?? path.join(process.env.COPILOT_HOME ?? path.join(home, '.copilot'), 'session-state');
+  if (fs.existsSync(recordsFile)) {
+    const saved = JSON.parse(fs.readFileSync(recordsFile, 'utf8'));
+    if (!Array.isArray(saved)) throw new Error('Invalid saved WebUI session index.');
+    for (const record of saved) {
+      if (!record || !SESSION_ID.test(record.id) || typeof record.cwd !== 'string' ||
+          typeof record.title !== 'string' || !Number.isFinite(Date.parse(record.createdAt))) {
+        throw new Error('Invalid saved WebUI session metadata.');
+      }
+      records.set(record.id, { ...record, status: 'archived' });
+    }
+  }
+  const saveRecords = () => {
+    const temporary = `${recordsFile}.tmp`;
+    fs.writeFileSync(temporary, JSON.stringify([...records.values()]), { mode: 0o600 });
+    fs.renameSync(temporary, recordsFile);
+  };
   const authSessions = new Map();
   const attempts = new Map();
   const spawnPty = options.spawnPty ?? pty.spawn;
@@ -131,6 +153,59 @@ export async function createApplication(options = {}) {
     return resolved;
   };
   const describe = s => ({ id: s.id, title: s.title, cwd: s.cwd, status: s.status, createdAt: s.createdAt, exitCode: s.exitCode });
+  const inUse = directory => {
+    if (!fs.existsSync(directory)) return false;
+    return fs.readdirSync(directory).some(name => {
+      const match = name.match(/^inuse\.(\d+)\.lock$/);
+      if (!match) return false;
+      try { process.kill(Number(match[1]), 0); return true; }
+      catch (error) {
+        if (error.code === 'ESRCH') return false;
+        if (error.code === 'EPERM') return true;
+        throw error;
+      }
+    });
+  };
+  const getHistory = () => {
+    const history = new Map();
+    if (fs.existsSync(sessionStateDir)) {
+      for (const entry of fs.readdirSync(sessionStateDir, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !SESSION_ID.test(entry.name)) continue;
+        const directory = path.join(sessionStateDir, entry.name);
+        const metadata = path.join(directory, 'workspace.yaml');
+        if (!fs.existsSync(metadata)) continue;
+        const record = parseYaml(fs.readFileSync(metadata, 'utf8'));
+        if (!record || record.id !== entry.name || typeof record.cwd !== 'string' ||
+            !Number.isFinite(Date.parse(record.created_at))) {
+          console.error(`Invalid CLI session metadata: ${metadata}`);
+          continue;
+        }
+        const title = typeof record.name === 'string' ? record.name.trim() : '';
+        if (!title) {
+          const eventsFile = path.join(directory, 'events.jsonl');
+          const hasMessages = fs.existsSync(eventsFile) && fs.readFileSync(eventsFile, 'utf8')
+            .split('\n').some(line => {
+              if (!line.trim()) return false;
+              return JSON.parse(line).type === 'user.message';
+            });
+          if (!hasMessages) continue;
+        }
+        history.set(entry.name, {
+          id: entry.name, cwd: record.cwd,
+          title: title || path.basename(record.cwd),
+          createdAt: record.created_at, status: 'archived', exitCode: null,
+          busy: sessions.has(entry.name) || stoppingSessions.has(entry.name) || inUse(directory),
+        });
+      }
+    }
+    return [...history.values()].filter(record => {
+      try { workspace(record.cwd); return true; }
+      catch (error) {
+        if (error instanceof HttpError) return false;
+        throw error;
+      }
+    }).sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+  };
   const emit = (s, message) => {
     const payload = JSON.stringify(message);
     for (const ws of s.clients) {
@@ -140,7 +215,10 @@ export async function createApplication(options = {}) {
     }
   };
   const dispose = s => {
+    records.set(s.id, { ...describe(s), status: s.status === 'running' ? 'stopping' : 'archived' });
+    saveRecords();
     if (s.status === 'running') {
+      stoppingSessions.add(s.id);
       try { s.pty.kill('SIGTERM'); } catch (error) { console.error(`Failed to stop terminal ${s.id}: ${error.message}`); }
       const timer = setTimeout(() => {
         if (s.status === 'running') {
@@ -212,17 +290,27 @@ export async function createApplication(options = {}) {
         return send(res, 200, { path: cwd, parent: cwd === home ? null : path.dirname(cwd), directories });
       }
       if (url.pathname === '/api/sessions' && req.method === 'GET') return send(res, 200, { sessions: [...sessions.values()].map(describe) });
+      if (url.pathname === '/api/history' && req.method === 'GET') return send(res, 200, { sessions: getHistory() });
       if (url.pathname === '/api/sessions' && req.method === 'POST') {
         const body = await jsonBody(req);
         if (sessions.size >= maxSessions) throw new HttpError(409, `最多保留 ${maxSessions} 个会话，请先关闭不需要的会话。`);
-        const cwd = workspace(body.cwd ?? home);
-        const terminal = spawnPty(command, [], {
+        let previous;
+        if (body.resumeId !== undefined) {
+          if (typeof body.resumeId !== 'string' || !SESSION_ID.test(body.resumeId)) throw new HttpError(400, '历史会话 ID 无效。');
+          if (sessions.has(body.resumeId)) throw new HttpError(409, '该会话已经打开，请切换到现有会话。');
+          previous = getHistory().find(record => record.id === body.resumeId);
+          if (!previous) throw new HttpError(404, '历史会话不存在、正在使用或工作目录不可用。');
+          if (previous.busy) throw new HttpError(409, '该会话正在其他终端使用，暂时不能恢复。');
+        }
+        const cwd = workspace(previous?.cwd ?? body.cwd ?? home);
+        const sessionId = previous?.id ?? randomUUID();
+        const terminal = spawnPty(command, ['--session-id', sessionId], {
           name: 'xterm-256color', cols: clamp(body.cols, 40, 300, 120), rows: clamp(body.rows, 8, 120, 32),
           cwd, env: { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' },
         });
         const s = {
-          id: randomUUID(), title: path.basename(cwd), cwd, status: 'running',
-          createdAt: new Date().toISOString(), pty: terminal, history: '', clients: new Set(), exitCode: null,
+          id: sessionId, title: previous?.title ?? path.basename(cwd), cwd, status: 'running',
+          createdAt: previous?.createdAt ?? new Date().toISOString(), pty: terminal, history: '', clients: new Set(), exitCode: null,
         };
         sessions.set(s.id, s);
         terminal.onData(data => {
@@ -230,10 +318,24 @@ export async function createApplication(options = {}) {
           emit(s, { type: 'output', data });
         });
         terminal.onExit(({ exitCode }) => {
+          stoppingSessions.delete(s.id);
           s.status = 'exited';
           s.exitCode = exitCode;
+          records.set(s.id, { ...describe(s), status: 'archived' });
+          try { saveRecords(); }
+          catch (error) {
+            console.error(`Unable to save session history: ${error.message}`);
+            emit(s, { type: 'error', message: '保存历史会话失败，请查看服务日志。' });
+          }
           emit(s, { type: 'exit', exitCode });
         });
+        records.set(s.id, { ...describe(s), status: 'running' });
+        try { saveRecords(); }
+        catch (error) {
+          sessions.delete(s.id);
+          terminal.kill('SIGTERM');
+          throw error;
+        }
         return send(res, 201, describe(s));
       }
       const match = url.pathname.match(/^\/api\/sessions\/([a-f0-9-]{36})$/);

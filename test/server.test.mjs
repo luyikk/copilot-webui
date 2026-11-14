@@ -15,7 +15,15 @@ const login = async () => {
   assert.equal(response.status, 200);
   return response.headers['set-cookie'][0].split(';')[0];
 };
-const createSession = (cwd = home) => request(base, '/api/sessions', { method: 'POST', cookie, json: { cwd } });
+const createSession = async (cwd = home) => {
+  const response = await request(base, '/api/sessions', { method: 'POST', cookie, json: { cwd } });
+  if (response.status === 201) {
+    const directory = path.join(home, '.copilot/session-state', response.body.id);
+    await fs.mkdir(directory, { recursive: true });
+    await fs.writeFile(path.join(directory, 'workspace.yaml'), `id: ${response.body.id}\ncwd: ${JSON.stringify(cwd)}\nname: 测试对话\ncreated_at: ${response.body.createdAt}\n`);
+  }
+  return response;
+};
 function socket(id, overrides = {}, options = {}) {
   return new WebSocket(`${base.replace('https:', 'wss:')}/ws/${id}`, {
     rejectUnauthorized: false, ...options, headers: { Origin: base, Cookie: cookie, ...overrides },
@@ -122,7 +130,7 @@ test('launches the actual command without a shell or approval-bypass arguments',
   assert.equal(response.status, 201);
   const terminal = mock.terminals.at(-1);
   assert.equal(terminal.options.cwd, path.join(home, 'project'));
-  assert.deepEqual(terminal.args, []);
+  assert.deepEqual(terminal.args, ['--session-id', response.body.id]);
   assert.equal(terminal.options.env.TERM, 'xterm-256color');
   assert.equal(response.body.status, 'running');
   assert.equal((await request(base, '/api/sessions', { cookie })).body.sessions.length, 1);
@@ -135,6 +143,64 @@ test('enforces session limits even for simultaneous creation requests', async ()
   const responses = await Promise.all([createSession(), createSession(), createSession(), createSession()]);
   assert.equal(responses.filter(r => r.status === 201).length, 2);
   assert.equal(responses.filter(r => r.status === 409).length, 2);
+});
+
+test('closed sessions remain in history and resume using the same CLI identity', async () => {
+  const created = await createSession(path.join(home, 'project'));
+  const id = created.body.id;
+  await request(base, `/api/sessions/${id}`, { method: 'DELETE', cookie });
+  const history = await request(base, '/api/history', { cookie });
+  assert.ok(history.body.sessions.some(s => s.id === id));
+  assert.equal((await request(base, '/api/sessions', { cookie })).body.sessions.length, 0);
+  const resumed = await request(base, '/api/sessions', { method: 'POST', cookie, json: { resumeId: id, cwd: '/etc' } });
+  assert.equal(resumed.status, 201);
+  assert.equal(resumed.body.id, id);
+  assert.equal(resumed.body.cwd, created.body.cwd);
+  assert.equal(resumed.body.createdAt, created.body.createdAt);
+  assert.deepEqual(mock.terminals.at(-1).args, ['--session-id', id]);
+  assert.equal((await request(base, '/api/history', { cookie })).body.sessions.find(s => s.id === id).busy, true);
+  assert.equal((await request(base, '/api/sessions', { method: 'POST', cookie, json: { resumeId: id } })).status, 409);
+  assert.equal((await request(base, '/api/sessions', { method: 'POST', cookie, json: { resumeId: 'bad-id' } })).status, 400);
+  assert.equal((await request(base, '/api/sessions', { method: 'POST', cookie, json: { resumeId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' } })).status, 404);
+  assert.equal((await fs.stat(path.join(temporary, 'state', 'sessions.json'))).mode & 0o777, 0o600);
+});
+
+test('history survives server restart and includes legacy CLI sessions but excludes live sessions', async () => {
+  const dataDir = path.join(temporary, 'restart-state');
+  const sessionStateDir = path.join(temporary, 'legacy-sessions');
+  const legacyId = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
+  const busyId = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
+  for (const id of [legacyId, busyId]) {
+    const directory = path.join(sessionStateDir, id);
+    await fs.mkdir(directory, { recursive: true });
+    await fs.writeFile(path.join(directory, 'workspace.yaml'), `id: ${id}\ncwd: ${JSON.stringify(home)}\nname: 旧会话\ncreated_at: 2026-11-14T00:00:00.000Z\n`);
+  }
+  await fs.writeFile(path.join(sessionStateDir, busyId, `inuse.${process.pid}.lock`), String(process.pid));
+  const secondaryMock = mockTerminal();
+  const options = { home, dataDir, sessionStateDir, host: '127.0.0.1', port: 0, spawnPty: secondaryMock.spawn };
+  let secondary = await createApplication(options);
+  let address = await secondary.listen();
+  const password = (await fs.readFile(secondary.keyFile, 'utf8')).trim();
+  const authenticate = async () => (await request(address, '/api/login', { method: 'POST', json: { key: password } })).headers['set-cookie'][0].split(';')[0];
+  try {
+    let loginCookie = await authenticate();
+    const created = await request(address, '/api/sessions', { method: 'POST', cookie: loginCookie, json: { cwd: home } });
+    await secondary.close();
+    secondary = await createApplication(options);
+    address = await secondary.listen();
+    loginCookie = await authenticate();
+    const history = (await request(address, '/api/history', { cookie: loginCookie })).body.sessions;
+    assert.ok(!history.some(s => s.id === created.body.id), 'WebUI-only records without a saved CLI conversation must not appear');
+    assert.ok(history.some(s => s.id === legacyId));
+    assert.equal(history.find(s => s.id === busyId).busy, true);
+    assert.equal((await request(address, '/api/sessions', { method: 'POST', cookie: loginCookie, json: { resumeId: busyId } })).status, 409);
+    const resumed = await request(address, '/api/sessions', { method: 'POST', cookie: loginCookie, json: { resumeId: legacyId } });
+    assert.equal(resumed.status, 201);
+    assert.deepEqual(secondaryMock.terminals.at(-1).args, ['--session-id', legacyId]);
+    assert.equal((await request(address, '/api/history')).status, 401);
+  } finally {
+    await secondary.close();
+  }
 });
 
 test('streams terminal input/output, resizes, replays history, and preserves disconnected sessions', async () => {
