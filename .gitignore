@@ -1,0 +1,14 @@
+node_modules/
+coverage/
+test-results/
+*.log
+.env
+.env.*
+!.env.example
+access-key
+tls-host
+*.pem
+*.key
+*.db
+*.db-shm
+*.db-wal
